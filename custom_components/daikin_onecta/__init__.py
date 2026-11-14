@@ -7,7 +7,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, OAuth2TokenRequestError, OAuth2TokenRequestReauthError
-from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.helpers import config_entry_oauth2_flow, device_registry as dr
 from homeassistant.helpers.config_entry_oauth2_flow import ImplementationUnavailableError
 from homeassistant.helpers.typing import ConfigType
 
@@ -47,6 +47,19 @@ def _pool_registry(hass: HomeAssistant) -> dict[str, DaikinApi]:
     return hass.data.setdefault(DOMAIN, {}).setdefault("pool", {})
 
 
+def _remove_pool_member_devices(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
+    """Remove devices that a pool member made before it joined the pool.
+
+    POOL: a pool member makes no entities, so its old devices stay empty.
+    A device that belongs only to this entry is deleted. The devices of the
+    primary entry are separate registry entries and stay.
+    """
+    registry = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(registry, config_entry.entry_id):
+        _LOGGER.info("Removing device '%s' from Daikin pool member '%s'", device.name, config_entry.title)
+        registry.async_update_device(device.id, remove_config_entry_id=config_entry.entry_id)
+
+
 def is_pool_member(config_entry: ConfigEntry) -> bool:
     """Return whether this entry only lends its rate limit to the pool."""
     return config_entry.options.get(CONF_POOL_MEMBER, False) is True
@@ -77,6 +90,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
         # POOL: register the account and stop. No coordinator, no platforms.
         _LOGGER.info("Daikin entry '%s' set up as API pool member", config_entry.title)
         pool[config_entry.entry_id] = daikin_api
+        _remove_pool_member_devices(hass, config_entry)
         config_entry.runtime_data = None
         config_entry.async_on_unload(config_entry.add_update_listener(update_listener))
         return True

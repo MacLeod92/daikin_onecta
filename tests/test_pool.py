@@ -7,8 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 from daikin_onecta.exceptions import OnectaAuthenticationError, OnectaRateLimitError
 from daikin_onecta.rate_limit import RateLimit
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
+from custom_components.daikin_onecta import _remove_pool_member_devices
 from custom_components.daikin_onecta.const import DOMAIN
 from custom_components.daikin_onecta.daikin_api import EVENT_POOL_EXHAUSTED, DaikinApi, async_load_blocks
 
@@ -194,3 +197,19 @@ async def test_pool_block_survives_restart(hass: HomeAssistant) -> None:
     assert again.is_blocked()
     again.clear_block()
     assert "member" not in hass.data[DOMAIN]["blocks"]
+
+
+async def test_pool_member_devices_removed(hass: HomeAssistant) -> None:
+    """Old devices of a pool member go, the primary devices stay."""
+    primary_entry = MockConfigEntry(domain=DOMAIN, entry_id="primary")
+    member_entry = MockConfigEntry(domain=DOMAIN, entry_id="member")
+    primary_entry.add_to_hass(hass)
+    member_entry.add_to_hass(hass)
+    registry = dr.async_get(hass)
+    registry.async_get_or_create(config_entry_id="primary", identifiers={(DOMAIN, "dev")})
+    registry.async_get_or_create(config_entry_id="member", identifiers={(DOMAIN, "dev_2")})
+
+    _remove_pool_member_devices(hass, member_entry)
+
+    assert dr.async_entries_for_config_entry(registry, "member") == []
+    assert len(dr.async_entries_for_config_entry(registry, "primary")) == 1
