@@ -17,7 +17,7 @@ from daikin_onecta.exceptions import OnectaAccessTokenError
 from .binary_sensor import migrate_legacy_binary_sensor_unique_ids
 from .const import CONF_POOL_MEMBER, DOMAIN
 from .coordinator import OnectaDataUpdateCoordinator
-from .daikin_api import DaikinApi
+from .daikin_api import DaikinApi, async_load_blocks
 from .device import migrate_legacy_entity_unique_ids, migrate_legacy_subdevice_identifiers
 from .sensor import migrate_legacy_sensor_unique_ids
 from .update import migrate_legacy_update_unique_ids
@@ -62,6 +62,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
             translation_key="oauth2_implementation_unavailable",
         ) from err
 
+    await async_load_blocks(hass)
     pool = _pool_registry(hass)
     daikin_api = DaikinApi(hass, config_entry, implementation, pool)
 

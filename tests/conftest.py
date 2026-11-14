@@ -234,3 +234,18 @@ def mock_config_entry_v1_1(token_entry: dict[str, Any]) -> MockConfigEntry:
         },
         minor_version=1,
     )
+
+
+@pytest.fixture(autouse=True)
+def pool_no_block(request: pytest.FixtureRequest):
+    """POOL: keep upstream tests on upstream behavior.
+
+    Upstream tests send calls after a 429 and expect them to reach the API.
+    The fork blocks an account after a 429 or at 0 quota, so these tests run
+    with the block turned off. test_pool.py tests the block itself.
+    """
+    if request.module.__name__.endswith("test_pool"):
+        yield
+        return
+    with patch("custom_components.daikin_onecta.daikin_api.DaikinApi.is_blocked", return_value=False):
+        yield

@@ -9,7 +9,8 @@ from daikin_onecta.rate_limit import RateLimit
 from homeassistant.core import HomeAssistant
 import pytest
 
-from custom_components.daikin_onecta.daikin_api import DaikinApi
+from custom_components.daikin_onecta.const import DOMAIN
+from custom_components.daikin_onecta.daikin_api import EVENT_POOL_EXHAUSTED, DaikinApi, async_load_blocks
 
 
 def _api(hass: HomeAssistant, entry_id: str, day: int | None, pool: dict | None = None) -> DaikinApi:
@@ -132,3 +133,64 @@ async def test_pool_rate_limits_are_summed(hass: HomeAssistant) -> None:
     assert limits["remaining_day"] == 250
     assert limits["minute"] == 40
     assert len(primary.pool_status) == 2
+
+
+async def test_pool_never_calls_blocked_accounts(hass: HomeAssistant) -> None:
+    """When every account is blocked, no call goes out and one event fires."""
+    pool: dict = {}
+    primary = _api(hass, "primary", 100, pool)
+    member = _api(hass, "member", 150)
+    pool["member"] = member
+    for api in (primary, member):
+        api._client.get_gateway_devices = AsyncMock(side_effect=_rate_error(600))
+    events = []
+    hass.bus.async_listen(EVENT_POOL_EXHAUSTED, events.append)
+
+    with pytest.raises(OnectaRateLimitError):
+        await primary.get_cloud_device_details()
+    assert primary._client.get_gateway_devices.await_count == 1
+    assert member._client.get_gateway_devices.await_count == 1
+
+    # Later calls and commands do not reach Daikin while blocked.
+    with pytest.raises(OnectaRateLimitError) as err:
+        await primary.get_cloud_device_details()
+    assert 590 < err.value.retry_after <= 600
+    command = AsyncMock()
+    assert await primary.async_execute_command(command) is False
+    command.assert_not_awaited()
+    assert primary._client.get_gateway_devices.await_count == 1
+    assert member._client.get_gateway_devices.await_count == 1
+
+    await hass.async_block_till_done()
+    assert len(events) == 1
+    assert events[0].data["accounts"] == 2
+
+
+async def test_pool_stops_at_zero_day_quota(hass: HomeAssistant) -> None:
+    """An account whose response shows 0 day quota is not used again."""
+    pool: dict = {}
+    primary = _api(hass, "primary", 100, pool)
+    member = _api(hass, "member", 150)
+    pool["member"] = member
+
+    async def last_call() -> list[str]:
+        member._client.rate_limit = RateLimit(day_remaining=0, minute_remaining=10, reset=3600)
+        return ["member"]
+
+    member._client.get_gateway_devices = AsyncMock(side_effect=last_call)
+    assert await primary.get_cloud_device_details() == ["member"]
+    assert member.is_blocked()
+    assert await primary.get_cloud_device_details() == ["primary"]
+    assert member._client.get_gateway_devices.await_count == 1
+
+
+async def test_pool_block_survives_restart(hass: HomeAssistant) -> None:
+    """A saved block is read back when the API object is made again."""
+    await async_load_blocks(hass)
+    member = _api(hass, "member", 150)
+    member.block(3600)
+    assert "member" in hass.data[DOMAIN]["blocks"]
+    again = _api(hass, "member", 150)
+    assert again.is_blocked()
+    again.clear_block()
+    assert "member" not in hass.data[DOMAIN]["blocks"]

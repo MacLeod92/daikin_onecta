@@ -11,11 +11,13 @@ from homeassistant import config_entries, core
 from homeassistant.exceptions import OAuth2TokenRequestError, OAuth2TokenRequestReauthError
 from homeassistant.helpers import config_entry_oauth2_flow, issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from daikin_onecta.client import OnectaClient
 from daikin_onecta.exceptions import OnectaApiError, OnectaAuthenticationError, OnectaConnectionError, OnectaRateLimitError
 from daikin_onecta.models import GatewayDevice
+from daikin_onecta.rate_limit import RateLimit
 
 from .const import DOMAIN
 
@@ -24,6 +26,27 @@ _LOGGER = logging.getLogger(__name__)
 # POOL: how long to skip a pool member after a failure without a Retry-After value.
 POOL_DEFAULT_BLOCK = timedelta(seconds=60)
 POOL_TOKEN_ERROR_BLOCK = timedelta(minutes=5)
+# POOL: how long to skip an account whose day counter shows 0 when Daikin
+# gives no usable reset time. Daikin adds calls made while rate limited to the
+# next window, so the code must not probe an exhausted account often.
+POOL_DAY_EXHAUSTED_BLOCK = timedelta(hours=1)
+
+# POOL: event fired once when no account can take calls any more.
+EVENT_POOL_EXHAUSTED = f"{DOMAIN}_rate_limited"
+
+BLOCK_STORE_KEY = f"{DOMAIN}.rate_limit_blocks"
+BLOCK_STORE_VERSION = 1
+BLOCK_STORE_DELAY = 5
+
+
+async def async_load_blocks(hass: core.HomeAssistant) -> None:
+    """Load saved account blocks, so that they survive a restart."""
+    data = hass.data.setdefault(DOMAIN, {})
+    if "block_store" in data:
+        return
+    store: Store[dict[str, str]] = Store(hass, BLOCK_STORE_VERSION, BLOCK_STORE_KEY)
+    data["block_store"] = store
+    data["blocks"] = await store.async_load() or {}
 
 
 class DaikinApi:
@@ -45,8 +68,12 @@ class DaikinApi:
         """
         self.hass = hass
         self._pool = pool if pool is not None else {}
-        self._blocked_until: datetime | None = None
         self._config_entry = entry
+        self._blocked_until: datetime | None = None
+        saved = hass.data.get(DOMAIN, {}).get("blocks", {}).get(entry.entry_id)
+        if saved:
+            self._blocked_until = dt_util.parse_datetime(saved)
+        self._pool_exhausted = False
         self.session = config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
         self._client = OnectaClient(async_get_clientsession(hass), self.async_get_access_token)
 
@@ -118,13 +145,50 @@ class DaikinApi:
         return self._blocked_until
 
     def block(self, seconds: int | None, default: timedelta = POOL_DEFAULT_BLOCK) -> None:
-        """Skip this account in the pool for a period."""
+        """Skip this account for a period. A longer existing block stays."""
         delta = timedelta(seconds=seconds) if seconds else default
-        self._blocked_until = dt_util.utcnow() + delta
+        until = dt_util.utcnow() + delta
+        if self._blocked_until is None or until > self._blocked_until:
+            self._blocked_until = until
+            self._save_block()
 
     def clear_block(self) -> None:
         """Stop skipping this account."""
-        self._blocked_until = None
+        if self._blocked_until is not None:
+            self._blocked_until = None
+            self._save_block()
+
+    def _save_block(self) -> None:
+        """Write the block time of this account to storage."""
+        data = self.hass.data.get(DOMAIN, {})
+        store: Store | None = data.get("block_store")
+        if store is None:
+            return
+        blocks: dict[str, str] = data.setdefault("blocks", {})
+        if self._blocked_until is None:
+            blocks.pop(self._config_entry.entry_id, None)
+        else:
+            blocks[self._config_entry.entry_id] = self._blocked_until.isoformat()
+        store.async_delay_save(lambda: dict(blocks), BLOCK_STORE_DELAY)
+
+    def block_if_exhausted(self) -> None:
+        """Block this account when its last response shows no quota left.
+
+        POOL: Daikin can accept a few calls after the counter shows 0, but
+        it adds them to the next window. So the code stops at 0 and does not
+        wait for the 429.
+        """
+        limits = self.own_rate_limits
+        reset = limits["ratelimit_reset"]
+        if limits["remaining_day"] == 0:
+            # RateLimit-Reset can be the minute window. Only trust a value
+            # that is longer than one minute for the day window.
+            if reset is not None and reset > 60:
+                self.block(reset)
+            else:
+                self.block(None, POOL_DAY_EXHAUSTED_BLOCK)
+        elif limits["remaining_minutes"] == 0:
+            self.block(reset if reset and reset <= 60 else None)
 
     def is_blocked(self) -> bool:
         """Return whether the pool skips this account now."""
@@ -135,27 +199,58 @@ class DaikinApi:
         return [self, *(api for api in self._pool.values() if api is not self)]
 
     def _ordered_members(self) -> list["DaikinApi"]:
-        """Return the accounts to try, best first.
+        """Return the accounts that may take a call, best first.
 
-        POOL: an account that is not blocked comes first. Then the account
-        with the most remaining day quota (unknown counts as most, so that a
-        new member gets measured). The primary wins a tie, because sort is
-        stable. Blocked accounts are tried last, so a call is still attempted
-        when all accounts are blocked.
+        POOL: blocked accounts are left out. Daikin adds calls made while
+        rate limited to the next window, so a call to a blocked account
+        makes the block longer. The account with the most remaining day
+        quota comes first (unknown counts as most, so that a new member gets
+        measured). The primary wins a tie, because sort is stable.
         """
         big = 1 << 30
 
-        def key(member: "DaikinApi") -> tuple[int, int, int]:
+        def key(member: "DaikinApi") -> tuple[int, int]:
             limits = member.own_rate_limits
             day = limits["remaining_day"]
             minute = limits["remaining_minutes"]
             return (
-                1 if member.is_blocked() else 0,
                 -(big if day is None else day),
                 -(big if minute is None else minute),
             )
 
-        return sorted(self.pool_members(), key=key)
+        return sorted((m for m in self.pool_members() if not m.is_blocked()), key=key)
+
+    def _pool_rate_error(self) -> OnectaRateLimitError:
+        """Return a local rate-limit error for when every account is blocked."""
+        now = dt_util.utcnow()
+        ends = [m.blocked_until for m in self.pool_members() if m.blocked_until is not None]
+        retry_after = max(1, int((min(ends) - now).total_seconds())) if ends else int(POOL_DEFAULT_BLOCK.total_seconds())
+        limits = self.rate_limits
+        rate_limit = RateLimit(
+            minute_limit=limits["minute"],
+            day_limit=limits["day"],
+            minute_remaining=limits["remaining_minutes"],
+            day_remaining=limits["remaining_day"],
+            retry_after=retry_after,
+            reset=retry_after,
+        )
+        return OnectaRateLimitError(rate_limit, method="POOL", path="(no call sent)")
+
+    def _set_pool_exhausted(self, exhausted: bool, retry_after: int | None = None) -> None:
+        """Fire an event when the pool becomes exhausted."""
+        if exhausted and not self._pool_exhausted:
+            until = dt_util.utcnow() + timedelta(seconds=retry_after or 0)
+            _LOGGER.warning("All Daikin accounts are rate limited until %s, no calls are sent", until.isoformat())
+            self.hass.bus.async_fire(
+                EVENT_POOL_EXHAUSTED,
+                {
+                    "entry_id": self._config_entry.entry_id,
+                    "accounts": len(self.pool_members()),
+                    "retry_after": retry_after,
+                    "until": until.isoformat(),
+                },
+            )
+        self._pool_exhausted = exhausted
 
     async def _pooled(self, call: Callable[[OnectaClient], Awaitable[Any]]) -> Any:
         """Run one API call on the best account and fail over on a rate limit.
@@ -166,6 +261,10 @@ class DaikinApi:
         raised as before, so upstream behavior (reauth, UpdateFailed) stays.
         """
         members = self._ordered_members()
+        if not members:
+            err = self._pool_rate_error()
+            self._set_pool_exhausted(True, err.retry_after)
+            raise err
         last_rate_error: OnectaRateLimitError | None = None
         for member in members:
             is_primary = member is self
@@ -202,10 +301,19 @@ class DaikinApi:
                 member.block(None, POOL_TOKEN_ERROR_BLOCK)
                 continue
             member.clear_block()
+            member.block_if_exhausted()
+            self._set_pool_exhausted(False)
             if len(members) > 1:
                 _LOGGER.debug("Daikin call served by account '%s'", member.config_entry.title)
             return result
-        assert last_rate_error is not None
+        if last_rate_error is None:
+            # Every account failed on its token. Report it as a rate limit,
+            # so that the caller waits.
+            err = self._pool_rate_error()
+            self._set_pool_exhausted(True, err.retry_after)
+            raise err
+        if not self._ordered_members():
+            self._set_pool_exhausted(True, self._pool_rate_error().retry_after)
         raise last_rate_error
 
     @property
