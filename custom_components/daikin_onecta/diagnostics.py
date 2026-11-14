@@ -47,9 +47,12 @@ def get_entities(hass: HomeAssistant, config_entry: ConfigEntry) -> dict[str, di
 
 async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: ConfigEntry) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
-    coordinator: OnectaDataUpdateCoordinator = config_entry.runtime_data
+    coordinator: OnectaDataUpdateCoordinator | None = config_entry.runtime_data
+    if coordinator is None:
+        return {"pool_member": True, "options": config_entry.options}
     daikin_api = coordinator.api
     return {
+        "pool": daikin_api.pool_status,
         "json_data": async_redact_data(
             [device.device.to_dict() for device in (coordinator.data or {}).values()],
             REDACT_KEYS,

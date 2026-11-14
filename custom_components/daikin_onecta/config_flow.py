@@ -15,7 +15,7 @@ import probatio
 from daikin_onecta.auth import get_account_id
 from daikin_onecta.exceptions import OnectaAccessTokenError
 
-from .const import CONF_HOMEKIT_FAN_MODE_ALIASES, DOMAIN
+from .const import CONF_HOMEKIT_FAN_MODE_ALIASES, CONF_POOL_MEMBER, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 OAUTH_SCOPES = [
@@ -38,6 +38,7 @@ OPTIONS_SCHEMA = probatio.Schema(
             NumberSelectorConfig(min=20, max=300, step=1),
         ),
         probatio.Required(CONF_HOMEKIT_FAN_MODE_ALIASES, default=False): BooleanSelector(),
+        probatio.Required(CONF_POOL_MEMBER, default=False): BooleanSelector(),
     }
 )
 

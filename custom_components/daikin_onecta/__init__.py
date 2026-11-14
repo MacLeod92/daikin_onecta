@@ -15,7 +15,7 @@ from daikin_onecta.auth import get_account_id
 from daikin_onecta.exceptions import OnectaAccessTokenError
 
 from .binary_sensor import migrate_legacy_binary_sensor_unique_ids
-from .const import DOMAIN
+from .const import CONF_POOL_MEMBER, DOMAIN
 from .coordinator import OnectaDataUpdateCoordinator
 from .daikin_api import DaikinApi
 from .device import migrate_legacy_entity_unique_ids, migrate_legacy_subdevice_identifiers
@@ -42,6 +42,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
+def _pool_registry(hass: HomeAssistant) -> dict[str, DaikinApi]:
+    """Return the shared registry of pool member accounts."""
+    return hass.data.setdefault(DOMAIN, {}).setdefault("pool", {})
+
+
+def is_pool_member(config_entry: ConfigEntry) -> bool:
+    """Return whether this entry only lends its rate limit to the pool."""
+    return config_entry.options.get(CONF_POOL_MEMBER, False) is True
+
+
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Establish connection with Daikin."""
     try:
@@ -52,7 +62,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
             translation_key="oauth2_implementation_unavailable",
         ) from err
 
-    daikin_api = DaikinApi(hass, config_entry, implementation)
+    pool = _pool_registry(hass)
+    daikin_api = DaikinApi(hass, config_entry, implementation, pool)
 
     try:
         await daikin_api.async_get_access_token()
@@ -60,6 +71,14 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
         raise ConfigEntryAuthFailed from err
     except (OAuth2TokenRequestError, aiohttp.ClientError) as err:
         raise ConfigEntryNotReady from err
+
+    if is_pool_member(config_entry):
+        # POOL: register the account and stop. No coordinator, no platforms.
+        _LOGGER.info("Daikin entry '%s' set up as API pool member", config_entry.title)
+        pool[config_entry.entry_id] = daikin_api
+        config_entry.runtime_data = None
+        config_entry.async_on_unload(config_entry.add_update_listener(update_listener))
+        return True
 
     config_entry.runtime_data = OnectaDataUpdateCoordinator(hass, config_entry, daikin_api)
 
@@ -80,11 +99,20 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
 async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.debug("Unloading integration")
+    if config_entry.runtime_data is None:
+        _pool_registry(hass).pop(config_entry.entry_id, None)
+        return True
     return await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
 
 
 async def update_listener(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
     """Handle options update."""
+    # A pool member has no coordinator. Reload when the role changes.
+    if (config_entry.runtime_data is None) != is_pool_member(config_entry):
+        hass.config_entries.async_schedule_reload(config_entry.entry_id)
+        return
+    if config_entry.runtime_data is None:
+        return
     coordinator: OnectaDataUpdateCoordinator = config_entry.runtime_data
     coordinator.update_settings(config_entry)
     coordinator.async_update_listeners()

@@ -373,6 +373,7 @@
           "homekit_fan_mode_aliases": "Expose HomeKit compatible fan speed aliases",
           "low_scan_interval": "Low frequency period update interval (minutes)",
           "low_scan_start": "Low frequency period start time",
+          "pool_member": "API pool member only (lend this account's rate limit to the other Daikin entry, create no entities)",
           "scan_ignore": "Number of seconds that a data refresh is ignored after a command"
         },
         "description": "Configure Daikin Onecta Cloud polling",
